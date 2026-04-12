@@ -1,0 +1,94 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  docker-compose.yml — Bale VPN Tunnel (local dev / same-machine)   ║
+# ║  In production: build master on internet PC, slave on slave PC.    ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+version: "3.9"
+
+services:
+
+  # ── MASTER ─────────────────────────────────────────────────────────
+  master:
+    build:
+      context: ./master
+      dockerfile: Dockerfile
+    image: bale-vpn-master:latest
+    container_name: bale-master
+
+    # NET_ADMIN + /dev/net/tun are mandatory for TUN devices and iptables
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    environment:
+      - BALE_PHONE=${MASTER_BALE_PHONE}
+      - HEADLESS=${HEADLESS:-false}
+      - TUN_LOCAL_IP=10.0.0.1
+      - TUN_PEER_IP=10.0.0.2
+      - WS_BRIDGE_PORT=9876
+      - INTERNET_IFACE=eth0
+
+    volumes:
+      # Persist Bale login session between restarts
+      - master-session:/app/session
+
+    restart: unless-stopped
+
+    networks:
+      vpn-net:
+        ipv4_address: 172.20.0.10
+
+  # ── SLAVE ──────────────────────────────────────────────────────────
+  slave:
+    build:
+      context: ./slave
+      dockerfile: Dockerfile
+    image: bale-vpn-slave:latest
+    container_name: bale-slave
+
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+      # ─ WiFi adapter: uncomment and set correct path ─────────────
+      # - /dev/bus/usb/<bus>/<device>:/dev/bus/usb/<bus>/<device>
+
+    environment:
+      - BALE_PHONE=${SLAVE_BALE_PHONE}
+      - MASTER_BALE_PHONE=${MASTER_BALE_PHONE}
+      - HEADLESS=${HEADLESS:-false}
+      - TUN_LOCAL_IP=10.0.0.2
+      - TUN_PEER_IP=10.0.0.1
+      - WS_BRIDGE_PORT=9877
+      - WIFI_IFACE=${WIFI_IFACE:-wlan0}
+      - HOTSPOT_SSID=${HOTSPOT_SSID:-BaleTunnel}
+      - HOTSPOT_PASS=${HOTSPOT_PASS:-tunnel1234}
+
+    volumes:
+      - slave-session:/app/session
+
+    restart: unless-stopped
+
+    networks:
+      vpn-net:
+        ipv4_address: 172.20.0.11
+
+    # NOTE: For real slave deployment (separate machine), remove the
+    #       "networks" section above and use --network host so that
+    #       hostapd can control the physical WiFi adapter.
+
+volumes:
+  master-session:
+  slave-session:
+
+networks:
+  vpn-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

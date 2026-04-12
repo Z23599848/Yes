@@ -1,0 +1,18 @@
+{
+  "name": "bale-vpn-slave",
+  "version": "2.0.0",
+  "description": "Bale VPN Tunnel — Slave Node (LiveKit native client, WiFi hotspot)",
+  "main": "tunnel.js",
+  "scripts": {
+    "start": "node tunnel.js"
+  },
+  "dependencies": {
+    "@livekit/rtc-node": "^0.13.0",
+    "puppeteer": "^21.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

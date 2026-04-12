@@ -1,0 +1,8 @@
+# Bale VPN Tunnel — .gitignore
+.env
+**/session/
+**/chrome-profile/
+node_modules/
+**/node_modules/
+*.log
+*.pid
