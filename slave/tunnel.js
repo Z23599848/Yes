@@ -172,6 +172,43 @@ const SEARCH_SELECTORS = [
   '[class*="SearchInput"]',
 ];
 
+const PHONE_INPUT_SELECTORS = [
+  'input[type="tel"]',
+  'input[inputmode="tel"]',
+  'input[autocomplete="tel"]',
+  'input[name*="phone" i]',
+  'input[id*="phone" i]',
+  'input[placeholder*="phone" i]',
+  'input[placeholder*="mobile" i]',
+];
+
+const OTP_INPUT_SELECTORS = [
+  'input[autocomplete="one-time-code"]',
+  'input[inputmode="numeric"]',
+  'input[type="number"]',
+  'input[name*="otp" i]',
+  'input[name*="code" i]',
+  'input[id*="otp" i]',
+  'input[id*="code" i]',
+  'input[placeholder*="code" i]',
+];
+
+const SUBMIT_BUTTON_SELECTORS = [
+  'button[type="submit"]',
+  '[data-testid*="submit" i]',
+  '[data-testid*="continue" i]',
+  '[data-testid*="login" i]',
+];
+
+const LOGGED_IN_SELECTORS = [
+  '[data-testid="search"]',
+  '[data-testid="chat-list"]',
+  '[aria-label*="chat" i]',
+  '[class*="ChatList"]',
+  '[class*="Sidebar"]',
+  '.search-input',
+];
+
 function loadSavedToken() {
   try {
     if (CFG.LIVEKIT_TOKEN) return { token: CFG.LIVEKIT_TOKEN, url: CFG.LIVEKIT_URL };
@@ -222,6 +259,322 @@ async function saveCurrentSession(page) {
   } catch (_) {}
 }
 
+async function isVisibleHandle(handle) {
+  try {
+    return await handle.evaluate((el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style && style.visibility !== 'hidden' && style.display !== 'none' &&
+        rect.width > 0 && rect.height > 0 && !el.disabled;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+async function findVisibleHandle(page, selectors, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      try {
+        const handles = await page.$$(selector);
+        for (const handle of handles) {
+          if (await isVisibleHandle(handle)) return handle;
+          await handle.dispose().catch(() => {});
+        }
+      } catch (_) {}
+    }
+    await sleep(300);
+  }
+  return null;
+}
+
+async function findInputByKind(page, kind, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const handle = await page.evaluateHandle((inputKind) => {
+      const visible = (el) => {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== 'hidden' && style.display !== 'none' &&
+          rect.width > 0 && rect.height > 0 && !el.disabled;
+      };
+      const scoreInput = (el) => {
+        const attrs = [
+          el.type,
+          el.name,
+          el.id,
+          el.placeholder,
+          el.autocomplete,
+          el.inputMode,
+          el.getAttribute('aria-label') || '',
+        ].join(' ').toLowerCase();
+        let score = 0;
+        if (inputKind === 'phone') {
+          if (el.type === 'tel' || el.inputMode === 'tel') score += 8;
+          if (attrs.includes('phone') || attrs.includes('mobile') || attrs.includes('tel')) score += 6;
+          if (el.autocomplete === 'tel') score += 4;
+        } else {
+          if (el.autocomplete === 'one-time-code') score += 10;
+          if (el.inputMode === 'numeric' || el.type === 'number' || el.type === 'tel') score += 6;
+          if (attrs.includes('otp') || attrs.includes('code') || attrs.includes('verify')) score += 6;
+          if (el.maxLength > 0 && el.maxLength <= 8) score += 3;
+        }
+        return score;
+      };
+
+      const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+      const ranked = inputs
+        .map((input) => ({ input, score: scoreInput(input) }))
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score);
+
+      return ranked[0]?.input || null;
+    }, kind);
+    const element = handle.asElement();
+    if (element) return element;
+    await handle.dispose().catch(() => {});
+    await sleep(300);
+  }
+  return null;
+}
+
+async function hasAnyVisible(page, selectors) {
+  for (const selector of selectors) {
+    try {
+      const handles = await page.$$(selector);
+      for (const handle of handles) {
+        if (await isVisibleHandle(handle)) return true;
+        await handle.dispose().catch(() => {});
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+async function detectAuthState(page, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await hasAnyVisible(page, LOGGED_IN_SELECTORS)) return 'logged-in';
+    if (await findVisibleHandle(page, OTP_INPUT_SELECTORS, 500) || await findInputByKind(page, 'otp', 500)) return 'otp';
+    if (await findVisibleHandle(page, PHONE_INPUT_SELECTORS, 500) || await findInputByKind(page, 'phone', 500)) return 'phone';
+    await sleep(500);
+  }
+  return 'unknown';
+}
+
+async function clearAndType(handle, value) {
+  await handle.click({ clickCount: 3 });
+  await handle.press('Backspace').catch(() => {});
+  await handle.type(value, { delay: 35 });
+}
+
+async function submitCurrentForm(page) {
+  const button = await findVisibleHandle(page, SUBMIT_BUTTON_SELECTORS, 800);
+  if (button) await button.click().catch(() => {});
+  else await page.keyboard.press('Enter').catch(() => {});
+  await sleep(800);
+}
+
+async function visibleOtpInputs(page) {
+  const handles = [];
+  for (const selector of OTP_INPUT_SELECTORS) {
+    try {
+      const found = await page.$$(selector);
+      for (const handle of found) {
+        if (await isVisibleHandle(handle)) handles.push(handle);
+        else await handle.dispose().catch(() => {});
+      }
+    } catch (_) {}
+  }
+  return handles;
+}
+
+async function clearOtpInputs(page) {
+  const inputs = await visibleOtpInputs(page);
+  for (const input of inputs) {
+    try {
+      await input.click({ clickCount: 3 });
+      await input.press('Backspace');
+    } catch (_) {}
+  }
+}
+
+async function typeOtpCode(page, code) {
+  const inputs = await visibleOtpInputs(page);
+  if (inputs.length > 1 && code.length >= inputs.length) {
+    for (let i = 0; i < inputs.length && i < code.length; i++) {
+      await clearAndType(inputs[i], code[i]);
+    }
+  } else {
+    const input = inputs[0] || await findInputByKind(page, 'otp', 10_000);
+    if (!input) throw new Error('Could not find Bale OTP input.');
+    await clearAndType(input, code);
+  }
+  await submitCurrentForm(page);
+}
+
+async function waitForLoggedIn(page, timeoutMs = 25_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await detectAuthState(page, 1_000);
+    if (state === 'logged-in') return true;
+    if (state === 'unknown') {
+      const hasLoginInput = await findVisibleHandle(page, PHONE_INPUT_SELECTORS, 500) ||
+        await findVisibleHandle(page, OTP_INPUT_SELECTORS, 500);
+      if (!hasLoginInput) return true;
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+async function ensureBaleLogin(page) {
+  let state = await detectAuthState(page, 15_000);
+  if (state === 'logged-in') {
+    log(tag('login'), 'Existing Bale session is active.');
+    return;
+  }
+
+  if (!CFG.BALE_PHONE) {
+    CFG.BALE_PHONE = await promptText('Enter Bale phone number');
+  }
+  if (!CFG.BALE_PHONE) throw new Error('BALE_PHONE is required for Bale login.');
+
+  if (state === 'phone' || state === 'unknown') {
+    log(tag('login'), 'Submitting Bale phone number.');
+    const phoneInput = await findVisibleHandle(page, PHONE_INPUT_SELECTORS, 10_000) ||
+      await findInputByKind(page, 'phone', 20_000);
+    if (!phoneInput && state === 'unknown') {
+      log(tag('login'), 'Could not identify login form; continuing with current Bale session.');
+      return;
+    }
+    if (!phoneInput) throw new Error('Could not find Bale phone-number input.');
+    await clearAndType(phoneInput, CFG.BALE_PHONE);
+    await submitCurrentForm(page);
+    state = await detectAuthState(page, 60_000);
+  }
+
+  if (state !== 'otp') {
+    if (await waitForLoggedIn(page, 10_000)) {
+      log(tag('login'), 'Bale login completed.');
+      await saveCurrentSession(page);
+      return;
+    }
+    throw new Error('Bale did not show an OTP input after phone submission.');
+  }
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const code = await promptSecret(`Enter Bale SMS code${attempt > 1 ? ' (retry)' : ''}`);
+    if (!code) continue;
+    await typeOtpCode(page, code);
+    if (await waitForLoggedIn(page, 25_000)) {
+      log(tag('login'), 'Bale login completed.');
+      await saveCurrentSession(page);
+      return;
+    }
+    log(tag('login'), 'That code did not complete login. Please try the latest SMS code.');
+    await clearOtpInputs(page);
+  }
+
+  throw new Error('Bale login did not complete after OTP retries.');
+}
+
+async function clickFirstSelector(page, selectors, timeoutMs = 10_000) {
+  const handle = await findVisibleHandle(page, selectors, timeoutMs);
+  if (!handle) return false;
+  await handle.click().catch(() => {});
+  return true;
+}
+
+async function clickByText(page, patterns) {
+  return await page.evaluate((sources) => {
+    const regexes = sources.map(([source, flags]) => new RegExp(source, flags));
+    const visible = (el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.visibility !== 'hidden' && style.display !== 'none' &&
+        rect.width > 0 && rect.height > 0 && !el.disabled;
+    };
+    const candidates = Array.from(document.querySelectorAll('button,[role="button"],a,div[tabindex]'));
+    for (const el of candidates) {
+      if (!visible(el)) continue;
+      const label = [
+        el.textContent || '',
+        el.getAttribute('aria-label') || '',
+        el.getAttribute('title') || '',
+        el.className || '',
+      ].join(' ');
+      if (regexes.some((regex) => regex.test(label))) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }, patterns.map((regex) => [regex.source, regex.flags]));
+}
+
+async function waitForLiveKitToken(page, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await page.evaluate(() => ({
+      token: window.__livekitToken,
+      url:   window.__livekitWsUrl,
+    }));
+    if (result.token) return result;
+    await sleep(500);
+  }
+  return { token: null, url: null };
+}
+
+async function autoStartCallToMaster(page) {
+  if (!CFG.MASTER_BALE_PHONE) {
+    log(tag('token'), 'MASTER_BALE_PHONE is empty. Please open the master chat and start a call manually.');
+    return false;
+  }
+
+  log(tag('token'), 'Opening master chat: ' + CFG.MASTER_BALE_PHONE);
+  const searchClicked = await clickFirstSelector(page, SEARCH_SELECTORS, 15_000);
+  if (!searchClicked) {
+    log(tag('token'), 'Could not find Bale search field.');
+    return false;
+  }
+
+  await sleep(500);
+  await page.keyboard.down('Control').catch(() => {});
+  await page.keyboard.press('KeyA').catch(() => {});
+  await page.keyboard.up('Control').catch(() => {});
+  await page.keyboard.press('Backspace').catch(() => {});
+  await page.keyboard.type(CFG.MASTER_BALE_PHONE, { delay: 60 });
+  await sleep(2_000);
+
+  const resultClicked = await clickFirstSelector(page, [
+    '[data-testid="search-result-item"]',
+    '[data-testid*="search-result" i]',
+    '[class*="SearchResult"]',
+    '[class*="contact"]',
+    '[class*="Chat"]',
+    '[role="option"]',
+  ], 10_000) || await clickByText(page, [new RegExp(CFG.MASTER_BALE_PHONE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))]);
+
+  if (!resultClicked) {
+    log(tag('token'), 'Could not select the master contact from search results.');
+    return false;
+  }
+
+  await sleep(1_500);
+  log(tag('token'), 'Clicking Bale voice-call button.');
+  const callClicked = await clickFirstSelector(page, CALL_BTN_SELECTORS, 10_000) ||
+    await clickByText(page, [/voice\s*call/i, /\bcall\b/i]);
+  if (!callClicked) {
+    log(tag('token'), 'Could not auto-click call button. Please click it manually.');
+    return false;
+  }
+
+  log(tag('token'), 'Call started; waiting for LiveKit token.');
+  return true;
+}
+
 async function acquireTokenViaBrowser() {
   log(tag('token'), 'Launching Chromium to capture LiveKit token …');
 
@@ -249,73 +602,20 @@ async function acquireTokenViaBrowser() {
     await page.reload({ waitUntil: 'networkidle2' });
   }
 
-  log(tag('token'), '─────────────────────────────────────────────────────');
-  log(tag('token'), ' ACTION REQUIRED:');
-  log(tag('token'), '  1. Log in to Bale if not already logged in.');
-  log(tag('token'), '  2. Open the chat with MASTER phone: ' + CFG.MASTER_BALE_PHONE);
-  log(tag('token'), '  3. Start a voice call to the master.');
-  log(tag('token'), '  4. Once call is ringing, press ENTER here.');
-  log(tag('token'), '─────────────────────────────────────────────────────');
+  await ensureBaleLogin(page);
 
-  // Try to automate: search for master and click call
-  if (CFG.MASTER_BALE_PHONE) {
-    await sleep(2000);
-    log(tag('token'), 'Trying to auto-open master chat …');
-
-    // Click search
-    for (const sel of SEARCH_SELECTORS) {
-      try { await page.click(sel, { timeout: 1500 }); break; } catch (_) {}
-    }
-    await sleep(500);
-    await page.keyboard.type(CFG.MASTER_BALE_PHONE, { delay: 80 });
-    await sleep(1500);
-
-    // Click first result
-    const resultSels = [
-      '[data-testid="search-result-item"]',
-      '[class*="SearchResult"]',
-      '[class*="contact"]',
-      '[class*="Chat"]',
-    ];
-    for (const sel of resultSels) {
-      try { await page.click(sel, { timeout: 1500 }); break; } catch (_) {}
-    }
-    await sleep(1000);
-
-    // Click call button
-    log(tag('token'), 'Trying to auto-click call button …');
-    let called = false;
-    for (const sel of CALL_BTN_SELECTORS) {
-      try {
-        await page.click(sel, { timeout: 1500 });
-        called = true;
-        log(tag('token'), '✓ Call button clicked');
-        break;
-      } catch (_) {}
-    }
-    if (!called) {
-      log(tag('token'), 'Could not auto-click call button. Please click it manually.');
-    }
+  const callStarted = await autoStartCallToMaster(page);
+  if (!callStarted) {
+    await promptEnter('Open the master chat and start the voice call, then press ENTER ...');
   }
 
-  await promptEnter('Press ENTER after the call is ringing/connected …');
   await saveCurrentSession(page);
-
-  // Wait for token
-  log(tag('token'), 'Waiting for LiveKit token …');
-  let token = null, url = null;
-  for (let i = 0; i < 60; i++) {
-    const r = await page.evaluate(() => ({
-      token: window.__livekitToken,
-      url:   window.__livekitWsUrl,
-    }));
-    if (r.token) { token = r.token; url = r.url; break; }
-    await sleep(500);
-  }
+  log(tag('token'), 'Waiting for LiveKit token ...');
+  const captured = await waitForLiveKitToken(page, 90_000);
 
   await browser.close();
 
-  if (!token) {
+  if (!captured.token) {
     throw new Error(
       'No LiveKit token captured.\n' +
       'Make sure the call started and the browser connected to wss://meet-em.ble.ir.\n' +
@@ -323,9 +623,10 @@ async function acquireTokenViaBrowser() {
     );
   }
 
-  const baseUrl = url ? url.split('?')[0].replace('/rtc', '') : CFG.LIVEKIT_URL;
-  saveToken(token, baseUrl);
-  return { token, url: baseUrl };
+  const capturedBaseUrl = captured.url ? captured.url.split('?')[0].replace('/rtc', '') : CFG.LIVEKIT_URL;
+  saveToken(captured.token, capturedBaseUrl);
+  return { token: captured.token, url: capturedBaseUrl };
+
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -387,6 +688,36 @@ async function connectAndTunnel(livekitUrl, token) {
 // 6. HELPERS
 // ══════════════════════════════════════════════════════════════════════
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function promptText(msg) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(msg + '\n', (answer) => { rl.close(); resolve(answer.trim()); });
+  });
+}
+
+function promptSecret(msg) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    const originalWrite = rl._writeToOutput;
+    rl.stdoutMuted = false;
+    rl._writeToOutput = function writeToOutput(str) {
+      if (rl.stdoutMuted) {
+        rl.output.write('*'.repeat(str.length));
+      } else {
+        originalWrite.call(rl, str);
+      }
+    };
+    rl.question(msg + '\n', (answer) => {
+      rl.history = [];
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer.trim());
+    });
+    rl.stdoutMuted = true;
+  });
+}
+
 function promptEnter(msg) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

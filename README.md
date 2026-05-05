@@ -332,6 +332,8 @@ bale-tunnel/
 ├── HAR_ANALYSIS.md        Bale internals: LiveKit protocol reverse engineering
 ├── .env.example           Root env config
 ├── .gitignore             Excludes .env, sessions, chrome profiles
+├── AI_CODER_PROMPT.md     Development prompt addendum for future AI coding
+├── setup.js               One-step wrapper for build/run/login configuration
 └── README.md              This file
 ```
 
@@ -352,7 +354,7 @@ This design keeps Node.js pure-JS while Python handles the privileged syscall.
 
 Responsibilities in order of execution:
 1. Check for saved LiveKit token → if none, launch Puppeteer
-2. Puppeteer opens Bale, user logs in + starts call → token captured + saved
+2. Puppeteer opens Bale, automates login/call setup, captures token + saves it
 3. Puppeteer closes — not needed again until token expires
 4. `@livekit/rtc-node` joins the LiveKit room
 5. Master: sets up iptables NAT, starts TUN, forwards packets to internet
@@ -368,6 +370,7 @@ Responsibilities in order of execution:
 |-------------|--------|-------|
 | Linux OS (real kernel, not WSL2) | ✅ | ✅ |
 | Docker Engine v24+ | ✅ | ✅ |
+| Node.js 18+ (for `setup.js`) | ✅ | ✅ |
 | `/dev/net/tun` device | ✅ | ✅ |
 | WiFi card with AP mode support | ❌ | ✅ |
 | Full internet access | ✅ | ❌ |
@@ -384,6 +387,37 @@ iw phy phy0 info | grep -A 10 "Supported interface modes"
 ls /dev/net/tun   # must exist
 modprobe tun      # load module if missing
 ```
+
+### One-step setup (recommended)
+
+Run the wrapper on each machine:
+
+```bash
+node setup.js
+```
+
+The wrapper asks whether the machine is `master` or `slave`, asks for the Bale
+phone number for that role, and on the slave also asks for the master's Bale
+phone number. It writes the ignored role-specific `.env` file, builds the
+matching Docker image, mounts `master/session` or `slave/session`, and starts
+the container.
+
+On the first run, the wrapper sets `HEADLESS=false` because no LiveKit token has
+been saved yet. Puppeteer opens Bale, submits the phone number, and prompts in
+the terminal for the SMS one-time code if Bale requests it. The code is used
+only for that login attempt and is not written to disk. The slave then opens the
+master chat and starts the call; the master waits for the incoming call and
+tries to accept it automatically. If Bale changes a selector, the terminal will
+ask you to click the missing UI step manually.
+
+After `session/livekit_token.json` exists, rerun `node setup.js` and the wrapper
+sets `HEADLESS=true`, skips Puppeteer, and connects directly with the saved
+token.
+
+### Manual Docker flow (advanced)
+
+The wrapper above is the normal path. Use the manual commands below only when
+you need to debug Docker options or override the generated `.env` files.
 
 ### Step 1 — Clone & configure
 
@@ -425,7 +459,9 @@ docker build -t bale-vpn-slave ./slave
 
 ### Step 3 — Run and capture tokens (first time only)
 
-Both machines run simultaneously. Each opens a browser window.
+Both machines run simultaneously. On first run, Puppeteer performs the Bale
+login and call setup. Be ready to enter the SMS OTP in the terminal if Bale
+requests verification.
 
 **Master:**
 ```bash
@@ -448,12 +484,11 @@ docker run --privileged --cap-add NET_ADMIN \
   -it bale-vpn-slave
 ```
 
-**In each browser window:**
-1. Log in with the respective Bale phone number (enter OTP)
-2. Slave: open chat with master's phone number, start a **voice call**
-3. Master: accept the call
-4. Once the call connects, press **ENTER** in each terminal
-5. The LiveKit token is saved — browser closes — tunnel starts
+**What happens next:**
+1. Each role logs in with its Bale phone number and prompts locally for OTP if needed
+2. Slave opens the master chat and starts a **voice call**
+3. Master detects and accepts the incoming call
+4. The LiveKit token is captured, saved, and the tunnel starts
 
 ### Step 4 — Subsequent runs (headless, no browser)
 
@@ -525,6 +560,12 @@ docker-compose up --build
 
 ## 🔑 Token Capture Flow
 
+Development instructions for future AI coding work are tracked in
+`AI_CODER_PROMPT.md`. That addendum explicitly requires SMS OTP handling during
+Bale phone-number login: the wrapper must prompt for the code, avoid logging or
+persisting it, retry invalid or timed-out codes, and only proceed to call setup
+and LiveKit token capture after login succeeds.
+
 The most important step. Here's exactly what happens inside the browser:
 
 ```javascript
@@ -542,8 +583,8 @@ window.WebSocket = function(url, ...args) {
 };
 ```
 
-Puppeteer polls `window.__livekitToken` after you press ENTER. Once found,
-it's saved to `livekit_token.json` and the browser closes.
+Puppeteer polls `window.__livekitToken` while the automated call setup runs.
+Once found, it's saved to `livekit_token.json` and the browser closes.
 
 **When does the token expire?**
 LiveKit tokens from Bale expire after ~6 hours (`exp` claim). When the token
@@ -553,8 +594,9 @@ via the `RoomEvent.TokenExpiring` event. Long-running tunnels should survive
 without re-login.
 
 **If the token is permanently expired:**
-Delete `session/livekit_token.json` and rerun with `HEADLESS=false` to
-capture a new one.
+Delete `master/session/livekit_token.json` or `slave/session/livekit_token.json`
+on the affected machine, then rerun `node setup.js`. The wrapper will set
+`HEADLESS=false` and capture a new token.
 
 ---
 
@@ -562,7 +604,7 @@ capture a new one.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `No LiveKit token captured` | Call didn't start before ENTER | Token fires on WS connect to `meet-em.ble.ir`; make sure call is ringing |
+| `No LiveKit token captured` | Call did not start/connect or Bale UI selectors changed | Token fires on WS connect to `meet-em.ble.ir`; use the manual fallback prompt to start/accept the call |
 | `canPublishData` error | Bale JWT lacks the flag | Use a newer Bale account or check if Bale changed their policy |
 | `TUN device not found` | Module not loaded | `modprobe tun` or add `--device /dev/net/tun` to docker run |
 | `Permission denied on /dev/net/tun` | Missing `CAP_NET_ADMIN` | Add `--privileged` or `--cap-add NET_ADMIN` |

@@ -173,6 +173,59 @@ const WS_INTERCEPT_SCRIPT = `
 })();
 `;
 
+const PHONE_INPUT_SELECTORS = [
+  'input[type="tel"]',
+  'input[inputmode="tel"]',
+  'input[autocomplete="tel"]',
+  'input[name*="phone" i]',
+  'input[id*="phone" i]',
+  'input[placeholder*="phone" i]',
+  'input[placeholder*="mobile" i]',
+];
+
+const OTP_INPUT_SELECTORS = [
+  'input[autocomplete="one-time-code"]',
+  'input[inputmode="numeric"]',
+  'input[type="number"]',
+  'input[name*="otp" i]',
+  'input[name*="code" i]',
+  'input[id*="otp" i]',
+  'input[id*="code" i]',
+  'input[placeholder*="code" i]',
+];
+
+const SUBMIT_BUTTON_SELECTORS = [
+  'button[type="submit"]',
+  '[data-testid*="submit" i]',
+  '[data-testid*="continue" i]',
+  '[data-testid*="login" i]',
+];
+
+const LOGGED_IN_SELECTORS = [
+  '[data-testid="search"]',
+  '[data-testid="chat-list"]',
+  '[aria-label*="chat" i]',
+  '[class*="ChatList"]',
+  '[class*="Sidebar"]',
+  '.search-input',
+];
+
+const ACCEPT_CALL_SELECTORS = [
+  '[data-testid="accept-call-button"]',
+  '[data-testid="incoming-call-accept"]',
+  '[data-testid*="accept" i]',
+  '[aria-label="Accept"]',
+  '[aria-label*="accept" i]',
+  '[aria-label*="answer" i]',
+  'button[title="Accept"]',
+  'button[title*="accept" i]',
+  'button[title*="answer" i]',
+  '[class*="Accept"]',
+  '[class*="Answer"]',
+  '[class*="answer"]',
+  '[class*="accept"]',
+];
+
 async function acquireTokenViaBrowser() {
   log(tag('token'), 'Launching browser to capture LiveKit token …');
 
@@ -201,38 +254,25 @@ async function acquireTokenViaBrowser() {
     await page.reload({ waitUntil: 'networkidle2' });
   }
 
-  log(tag('token'), '─────────────────────────────────────────────────────');
-  log(tag('token'), ' ACTION REQUIRED:');
-  log(tag('token'), '  1. If not logged in: log in to Bale now.');
-  log(tag('token'), '  2. Start a voice call with the slave account.');
-  log(tag('token'), '  3. Once the call is ringing/connected the token');
-  log(tag('token'), '     will be captured automatically.');
-  log(tag('token'), '  4. Press ENTER here when the call is ringing.');
-  log(tag('token'), '─────────────────────────────────────────────────────');
+  await ensureBaleLogin(page);
 
-  await promptEnter('Press ENTER after the call is ringing …');
-  await saveCurrentSession(page);
-
-  // Poll for the intercepted token (up to 30 s after ENTER)
-  log(tag('token'), 'Waiting for LiveKit token …');
-  let token = null, url = null;
-  for (let i = 0; i < 60; i++) {
-    const result = await page.evaluate(() => ({
-      token: window.__livekitToken,
-      url:   window.__livekitWsUrl,
-    }));
-    if (result.token) { token = result.token; url = result.url; break; }
-    await sleep(500);
+  const accepted = await autoAcceptIncomingCall(page, 90_000);
+  if (!accepted) {
+    await promptEnter('Accept the incoming Bale call manually, then press ENTER ...');
   }
+
+  await saveCurrentSession(page);
+  log(tag('token'), 'Waiting for LiveKit token ...');
+  const captured = await waitForLiveKitToken(page, 90_000);
 
   await browser.close();
 
-  if (!token) throw new Error('Failed to capture LiveKit token. Did the call start?');
+  if (!captured.token) throw new Error('Failed to capture LiveKit token. Did the call start?');
 
-  // Strip query params from URL to get base URL
-  const baseUrl = url ? url.split('?')[0].replace('/rtc', '') : CFG.LIVEKIT_URL;
-  saveToken(token, baseUrl);
-  return { token, url: baseUrl };
+  const capturedBaseUrl = captured.url ? captured.url.split('?')[0].replace('/rtc', '') : CFG.LIVEKIT_URL;
+  saveToken(captured.token, capturedBaseUrl);
+  return { token: captured.token, url: capturedBaseUrl };
+
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -269,6 +309,297 @@ async function saveCurrentSession(page) {
     fs.writeFileSync(CFG.SESSION_FILE, JSON.stringify({ cookies, localStorage: ls }));
     log(tag('session'), 'Saved.');
   } catch (_) {}
+}
+
+async function isVisibleHandle(handle) {
+  try {
+    return await handle.evaluate((el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style && style.visibility !== 'hidden' && style.display !== 'none' &&
+        rect.width > 0 && rect.height > 0 && !el.disabled;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+async function findVisibleHandle(page, selectors, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      try {
+        const handles = await page.$$(selector);
+        for (const handle of handles) {
+          if (await isVisibleHandle(handle)) return handle;
+          await handle.dispose().catch(() => {});
+        }
+      } catch (_) {}
+    }
+    await sleep(300);
+  }
+  return null;
+}
+
+async function findInputByKind(page, kind, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const handle = await page.evaluateHandle((inputKind) => {
+      const visible = (el) => {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== 'hidden' && style.display !== 'none' &&
+          rect.width > 0 && rect.height > 0 && !el.disabled;
+      };
+      const scoreInput = (el) => {
+        const attrs = [
+          el.type,
+          el.name,
+          el.id,
+          el.placeholder,
+          el.autocomplete,
+          el.inputMode,
+          el.getAttribute('aria-label') || '',
+        ].join(' ').toLowerCase();
+        let score = 0;
+        if (inputKind === 'phone') {
+          if (el.type === 'tel' || el.inputMode === 'tel') score += 8;
+          if (attrs.includes('phone') || attrs.includes('mobile') || attrs.includes('tel')) score += 6;
+          if (el.autocomplete === 'tel') score += 4;
+        } else {
+          if (el.autocomplete === 'one-time-code') score += 10;
+          if (el.inputMode === 'numeric' || el.type === 'number' || el.type === 'tel') score += 6;
+          if (attrs.includes('otp') || attrs.includes('code') || attrs.includes('verify')) score += 6;
+          if (el.maxLength > 0 && el.maxLength <= 8) score += 3;
+        }
+        return score;
+      };
+
+      const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+      const ranked = inputs
+        .map((input) => ({ input, score: scoreInput(input) }))
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score);
+
+      return ranked[0]?.input || null;
+    }, kind);
+    const element = handle.asElement();
+    if (element) return element;
+    await handle.dispose().catch(() => {});
+    await sleep(300);
+  }
+  return null;
+}
+
+async function hasAnyVisible(page, selectors) {
+  for (const selector of selectors) {
+    try {
+      const handles = await page.$$(selector);
+      for (const handle of handles) {
+        if (await isVisibleHandle(handle)) return true;
+        await handle.dispose().catch(() => {});
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+async function detectAuthState(page, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await hasAnyVisible(page, LOGGED_IN_SELECTORS)) return 'logged-in';
+    if (await findVisibleHandle(page, OTP_INPUT_SELECTORS, 500) || await findInputByKind(page, 'otp', 500)) return 'otp';
+    if (await findVisibleHandle(page, PHONE_INPUT_SELECTORS, 500) || await findInputByKind(page, 'phone', 500)) return 'phone';
+    await sleep(500);
+  }
+  return 'unknown';
+}
+
+async function clearAndType(handle, value) {
+  await handle.click({ clickCount: 3 });
+  await handle.press('Backspace').catch(() => {});
+  await handle.type(value, { delay: 35 });
+}
+
+async function submitCurrentForm(page) {
+  const button = await findVisibleHandle(page, SUBMIT_BUTTON_SELECTORS, 800);
+  if (button) await button.click().catch(() => {});
+  else await page.keyboard.press('Enter').catch(() => {});
+  await sleep(800);
+}
+
+async function visibleOtpInputs(page) {
+  const handles = [];
+  for (const selector of OTP_INPUT_SELECTORS) {
+    try {
+      const found = await page.$$(selector);
+      for (const handle of found) {
+        if (await isVisibleHandle(handle)) handles.push(handle);
+        else await handle.dispose().catch(() => {});
+      }
+    } catch (_) {}
+  }
+  return handles;
+}
+
+async function clearOtpInputs(page) {
+  const inputs = await visibleOtpInputs(page);
+  for (const input of inputs) {
+    try {
+      await input.click({ clickCount: 3 });
+      await input.press('Backspace');
+    } catch (_) {}
+  }
+}
+
+async function typeOtpCode(page, code) {
+  const inputs = await visibleOtpInputs(page);
+  if (inputs.length > 1 && code.length >= inputs.length) {
+    for (let i = 0; i < inputs.length && i < code.length; i++) {
+      await clearAndType(inputs[i], code[i]);
+    }
+  } else {
+    const input = inputs[0] || await findInputByKind(page, 'otp', 10_000);
+    if (!input) throw new Error('Could not find Bale OTP input.');
+    await clearAndType(input, code);
+  }
+  await submitCurrentForm(page);
+}
+
+async function waitForLoggedIn(page, timeoutMs = 25_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await detectAuthState(page, 1_000);
+    if (state === 'logged-in') return true;
+    if (state === 'unknown') {
+      const hasLoginInput = await findVisibleHandle(page, PHONE_INPUT_SELECTORS, 500) ||
+        await findVisibleHandle(page, OTP_INPUT_SELECTORS, 500);
+      if (!hasLoginInput) return true;
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+async function ensureBaleLogin(page) {
+  let state = await detectAuthState(page, 15_000);
+  if (state === 'logged-in') {
+    log(tag('login'), 'Existing Bale session is active.');
+    return;
+  }
+
+  if (!CFG.BALE_PHONE) {
+    CFG.BALE_PHONE = await promptText('Enter Bale phone number');
+  }
+  if (!CFG.BALE_PHONE) throw new Error('BALE_PHONE is required for Bale login.');
+
+  if (state === 'phone' || state === 'unknown') {
+    log(tag('login'), 'Submitting Bale phone number.');
+    const phoneInput = await findVisibleHandle(page, PHONE_INPUT_SELECTORS, 10_000) ||
+      await findInputByKind(page, 'phone', 20_000);
+    if (!phoneInput && state === 'unknown') {
+      log(tag('login'), 'Could not identify login form; continuing with current Bale session.');
+      return;
+    }
+    if (!phoneInput) throw new Error('Could not find Bale phone-number input.');
+    await clearAndType(phoneInput, CFG.BALE_PHONE);
+    await submitCurrentForm(page);
+    state = await detectAuthState(page, 60_000);
+  }
+
+  if (state !== 'otp') {
+    if (await waitForLoggedIn(page, 10_000)) {
+      log(tag('login'), 'Bale login completed.');
+      await saveCurrentSession(page);
+      return;
+    }
+    throw new Error('Bale did not show an OTP input after phone submission.');
+  }
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const code = await promptSecret(`Enter Bale SMS code${attempt > 1 ? ' (retry)' : ''}`);
+    if (!code) continue;
+    await typeOtpCode(page, code);
+    if (await waitForLoggedIn(page, 25_000)) {
+      log(tag('login'), 'Bale login completed.');
+      await saveCurrentSession(page);
+      return;
+    }
+    log(tag('login'), 'That code did not complete login. Please try the latest SMS code.');
+    await clearOtpInputs(page);
+  }
+
+  throw new Error('Bale login did not complete after OTP retries.');
+}
+
+async function clickFirstSelector(page, selectors, timeoutMs = 10_000) {
+  const handle = await findVisibleHandle(page, selectors, timeoutMs);
+  if (!handle) return false;
+  await handle.click().catch(() => {});
+  return true;
+}
+
+async function clickByText(page, patterns) {
+  return await page.evaluate((sources) => {
+    const regexes = sources.map(([source, flags]) => new RegExp(source, flags));
+    const visible = (el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.visibility !== 'hidden' && style.display !== 'none' &&
+        rect.width > 0 && rect.height > 0 && !el.disabled;
+    };
+    const candidates = Array.from(document.querySelectorAll('button,[role="button"],a,div[tabindex]'));
+    for (const el of candidates) {
+      if (!visible(el)) continue;
+      const label = [
+        el.textContent || '',
+        el.getAttribute('aria-label') || '',
+        el.getAttribute('title') || '',
+        el.className || '',
+      ].join(' ');
+      if (regexes.some((regex) => regex.test(label))) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }, patterns.map((regex) => [regex.source, regex.flags]));
+}
+
+async function waitForLiveKitToken(page, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await page.evaluate(() => ({
+      token: window.__livekitToken,
+      url:   window.__livekitWsUrl,
+    }));
+    if (result.token) return result;
+    await sleep(500);
+  }
+  return { token: null, url: null };
+}
+
+async function autoAcceptIncomingCall(page, timeoutMs = 90_000) {
+  log(tag('token'), 'Waiting for incoming Bale call to accept.');
+  const deadline = Date.now() + timeoutMs;
+  let clicked = false;
+
+  while (Date.now() < deadline) {
+    const captured = await waitForLiveKitToken(page, 500);
+    if (captured.token) return true;
+
+    if (await clickFirstSelector(page, ACCEPT_CALL_SELECTORS, 500) ||
+        await clickByText(page, [/\baccept\b/i, /\banswer\b/i])) {
+      clicked = true;
+      log(tag('token'), 'Incoming call accepted.');
+      await sleep(2_000);
+      continue;
+    }
+
+    await sleep(500);
+  }
+
+  return clicked;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -325,6 +656,35 @@ async function connectAndTunnel(livekitUrl, token) {
 // 6. HELPERS
 // ══════════════════════════════════════════════════════════════════════
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function promptText(msg) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(msg + '\n', (answer) => { rl.close(); resolve(answer.trim()); });
+  });
+}
+
+function promptSecret(msg) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    const originalWrite = rl._writeToOutput;
+    rl.stdoutMuted = false;
+    rl._writeToOutput = function writeToOutput(str) {
+      if (rl.stdoutMuted) {
+        rl.output.write('*'.repeat(str.length));
+      } else {
+        originalWrite.call(rl, str);
+      }
+    };
+    rl.question(msg + '\n', (answer) => {
+      rl.history = [];
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer.trim());
+    });
+    rl.stdoutMuted = true;
+  });
+}
 
 function promptEnter(msg) {
   return new Promise((resolve) => {
